@@ -64,7 +64,8 @@ static int Init()
 		}
 		else if (!bPort && IsTagMatch(buf, "PORT", &p))
 		{
-			g_Port = ::atoi(p);
+			::strncpy(g_Port, p, sizeof(g_Port) - 1);
+			g_Port[sizeof(g_Port) - 1] = '\0';
 			bPort = TRUE;
 		}
 		else if (!bBonDriver && IsTagMatch(buf, "BONDRIVER", &p))
@@ -96,7 +97,8 @@ static int Init()
 		}
 		else if (!bTargetPort && IsTagMatch(buf, "TARGET_PORT", &p))
 		{
-			g_TargetPort = ::atoi(p);
+			::strncpy(g_TargetPort, p, sizeof(g_TargetPort) - 1);
+			g_TargetPort[sizeof(g_TargetPort) - 1] = '\0';
 			bTargetPort = TRUE;
 		}
 		else if (!bTargetMac && IsTagMatch(buf, "TARGET_MACADDRESS", &p))
@@ -154,7 +156,7 @@ static int Init()
 		if (!bTargetHost)
 			::strcpy(g_TargetHost, g_Host);
 		if (!bTargetPort)
-			g_TargetPort = g_Port;
+			::strcpy(g_TargetPort, g_Port);
 	}
 
 	return 0;
@@ -882,10 +884,10 @@ const BOOL cProxyClient::SetLnbPower(const BOOL bEnable)
 	return FALSE;
 }
 
-static SOCKET Connect(char *host, unsigned short port)
+static SOCKET Connect(char *host, char *port)
 {
-	sockaddr_in server;
-	hostent *he;
+	struct addrinfo hints, *rp, *rp0;
+	struct sockaddr_storage server;
 	SOCKET sock;
 	int i, bf;
 	fd_set wd;
@@ -898,71 +900,66 @@ static SOCKET Connect(char *host, unsigned short port)
 		for (i = 1; i <= 16; i++)
 			::memcpy(&sendbuf[i * 6], g_TargetMac, 6);
 
-		sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-		if (sock == INVALID_SOCKET)
+		::memset(&hints, 0, sizeof(struct addrinfo));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_DGRAM;
+		if (::getaddrinfo(g_TargetHost, g_TargetPort, &hints, &rp0))
 			return INVALID_SOCKET;
 
-		BOOL opt = TRUE;
-		if (::setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (const char *)&opt, sizeof(opt)) != 0)
+		for (rp = rp0; rp != NULL; rp = rp->ai_next)
 		{
-			::close(sock);
-			return INVALID_SOCKET;
-		}
+			sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+			if (sock == INVALID_SOCKET)
+				continue;
 
-		::memset((char *)&server, 0, sizeof(server));
-		server.sin_family = AF_INET;
-		server.sin_addr.s_addr = ::inet_addr(g_TargetHost);
-		if (server.sin_addr.s_addr == INADDR_NONE)
-		{
-			he = ::gethostbyname(g_TargetHost);
-			if (he == NULL)
+			BOOL opt = TRUE;
+			if (::setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (const char *)&opt, sizeof(opt)) != 0)
 			{
 				::close(sock);
-				return INVALID_SOCKET;
+				continue;
 			}
-			::memcpy(&(server.sin_addr), *(he->h_addr_list), he->h_length);
+
+			int ret = ::sendto(sock, sendbuf, 102, 0, (sockaddr *)&server, sizeof(server));
+			::close(sock);
+
+			if (ret == 102)
+				break;
 		}
-		server.sin_port = htons(g_TargetPort);
-		int ret = ::sendto(sock, sendbuf, 102, 0, (sockaddr *)&server, sizeof(server));
-		::close(sock);
-		if (ret != 102)
+
+		::freeaddrinfo(rp0);
+		if (rp == NULL)
 			return INVALID_SOCKET;
 	}
 
-	sock = ::socket(AF_INET, SOCK_STREAM, 0);
-	if (sock == INVALID_SOCKET)
+
+	::memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (::getaddrinfo(host, port, &hints, &rp0))
 		return INVALID_SOCKET;
-	::memset((char *)&server, 0, sizeof(server));
-	server.sin_family = AF_INET;
-	server.sin_addr.s_addr = ::inet_addr(host);
-	if (server.sin_addr.s_addr == INADDR_NONE)
+	for (rp = rp0; rp != NULL; rp = rp->ai_next)
 	{
-		he = ::gethostbyname(host);
-		if (he == NULL)
-		{
-			::close(sock);
-			return INVALID_SOCKET;
-		}
-		::memcpy(&(server.sin_addr), *(he->h_addr_list), he->h_length);
-	}
-	server.sin_port = htons(port);
-	bf = TRUE;
-	::ioctl(sock, FIONBIO, &bf);
-	tv.tv_sec = g_ConnectTimeOut;
-	tv.tv_usec = 0;
-	FD_ZERO(&wd);
-	FD_SET(sock, &wd);
-	::connect(sock, (sockaddr *)&server, sizeof(server));
-	if ((i = ::select((int)(sock + 1), 0, &wd, 0, &tv)) == SOCKET_ERROR)
-	{
+		sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (sock == INVALID_SOCKET)
+			continue;
+
+		bf = TRUE;
+		::ioctl(sock, FIONBIO, &bf);
+		tv.tv_sec = g_ConnectTimeOut;
+		tv.tv_usec = 0;
+		FD_ZERO(&wd);
+		FD_SET(sock, &wd);
+		::connect(sock, rp->ai_addr, rp->ai_addrlen);
+		i = ::select((int)(sock + 1), 0, &wd, 0, &tv);
+		if ((i != SOCKET_ERROR) && (i != 0))
+			break;
+
 		::close(sock);
-		return INVALID_SOCKET;
 	}
-	if (i == 0)
-	{
-		::close(sock);
+	if(rp == NULL)
 		return INVALID_SOCKET;
-	}
+	::freeaddrinfo(rp0);
+
 	bf = FALSE;
 	::ioctl(sock, FIONBIO, &bf);
 	return sock;
